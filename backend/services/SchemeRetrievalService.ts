@@ -1,116 +1,94 @@
 // ============================================================
-// SchemeSathi — Scheme Retrieval Service
-// Searches, scores, and ranks cached schemes against a
-// UserProfile for maximum relevance.
+// SchemeSathi — Scheme Retrieval Layer
+// services/schemeRetrievalService.ts
+//
+// Responsibilities:
+//   1. Search Supabase cache for relevant schemes
+//   2. Rank schemes by profile relevance score
+//   3. Trigger discovery if < 5 relevant results found
+//   4. Save newly discovered schemes back to cache
+//   5. Return combined, ranked results
 // ============================================================
 
-import { getSupabaseClient } from "../lib/supabaseClient";
-import type {
-  UserProfile,
-  GovernmentScheme,
-  OccupationType,
-  SocialCategory,
-} from "../types";
+import { getSupabaseClient } from "../lib/supabase";
+import { SchemeDiscoveryService } from "./SchemeDiscoveryService";
+import {
+  saveMultipleSchemes,
+  type SchemeInsert,
+} from "./schemeCacheService";
+import type { UserProfile, GovernmentScheme, OccupationType, SocialCategory } from "../types";
+
+// ============================================================
+// Constants
+// ============================================================
+
+const MIN_RELEVANT_SCHEMES = 5;
+const DEFAULT_RETRIEVAL_LIMIT = 30;
+const DEFAULT_MIN_SCORE = 10;
 
 // ============================================================
 // Result types
 // ============================================================
 
-export interface ScoredScheme {
+export interface RankedScheme {
   scheme: GovernmentScheme;
-  relevanceScore: number;   // 0–100
-  matchBreakdown: MatchBreakdown;
+  relevanceScore: number;       // 0–100
+  scoreBreakdown: ScoreBreakdown;
 }
 
-export interface MatchBreakdown {
-  occupationScore: number;  // 0–30
-  categoryScore: number;    // 0–20
-  stateScore: number;       // 0–25
-  tagsScore: number;        // 0–15
-  incomeScore: number;      // 0–10
+export interface ScoreBreakdown {
+  occupationScore: number;      // 0–30
+  stateScore: number;           // 0–25
+  categoryScore: number;        // 0–20
+  tagsScore: number;            // 0–15
+  incomeScore: number;          // 0–10
 }
 
 export interface RetrievalResult {
-  schemes: ScoredScheme[];
-  averageRelevanceScore: number;
-  totalMatched: number;
+  schemes: RankedScheme[];
+  totalFound: number;
+  averageScore: number;
+  fromCache: number;            // how many came from Supabase cache
+  fromDiscovery: number;        // how many came from fresh discovery
+  discoveryTriggered: boolean;
+}
+
+export interface RetrievalOptions {
+  limit?: number;
+  minScore?: number;
+  forceDiscovery?: boolean;     // bypass cache and always discover
 }
 
 // ============================================================
-// Occupation → keyword mapping
+// Scoring keyword maps
 // ============================================================
 
 const OCCUPATION_KEYWORDS: Record<OccupationType, string[]> = {
-  Student: [
-    "scholarship", "student", "education", "college", "school",
-    "fellowship", "tuition", "academic", "merit", "study",
-  ],
-  Farmer: [
-    "farmer", "kisan", "agriculture", "crop", "irrigation",
-    "farming", "agri", "soil", "fertilizer", "harvest",
-    "livestock", "dairy", "fishery", "horticulture",
-  ],
-  "Self-Employed": [
-    "self-employed", "freelance", "self-employment", "independent",
-    "professional", "consultant",
-  ],
-  Salaried: [
-    "salaried", "employee", "EPF", "PF", "pension",
-    "provident fund", "gratuity",
-  ],
-  "Business Owner": [
-    "business", "MSME", "enterprise", "startup", "entrepreneur",
-    "manufacturing", "Mudra", "Udyam", "SME", "industry",
-    "commercial", "trade",
-  ],
-  "Daily Wage Worker": [
-    "labour", "labor", "worker", "wage", "unorganised",
-    "unorganized", "construction", "MGNREGA", "daily wage",
-  ],
-  Unemployed: [
-    "unemployment", "skill", "training", "vocational",
-    "placement", "PMKVY", "rozgar", "employment",
-  ],
-  Homemaker: [
-    "women", "mahila", "homemaker", "housewife",
-    "self-help group", "SHG", "nari",
-  ],
-  Retired: [
-    "senior citizen", "pension", "retired", "elderly",
-    "old age", "varishtha", "geriatric",
-  ],
+  Student:            ["scholarship", "student", "education", "college", "school", "fellowship", "academic", "tuition"],
+  Farmer:             ["farmer", "kisan", "agriculture", "crop", "irrigation", "agri", "soil", "harvest", "livestock", "dairy", "fishery"],
+  "Self-Employed":    ["self-employed", "freelance", "independent", "consultant", "self-employment"],
+  Salaried:           ["salaried", "employee", "epf", "provident fund", "gratuity", "pension"],
+  "Business Owner":   ["business", "msme", "enterprise", "startup", "entrepreneur", "mudra", "udyam", "industry", "manufacturing"],
+  "Daily Wage Worker":["labour", "labor", "worker", "wage", "unorganised", "mgnrega", "construction"],
+  Unemployed:         ["unemployment", "skill", "training", "vocational", "pmkvy", "rozgar", "placement"],
+  Homemaker:          ["women", "mahila", "homemaker", "housewife", "self-help", "shg", "nari"],
+  Retired:            ["senior citizen", "pension", "retired", "elderly", "old age", "varishtha"],
 };
-
-// ============================================================
-// Category → keyword mapping
-// ============================================================
 
 const CATEGORY_KEYWORDS: Record<SocialCategory, string[]> = {
-  General: [],
-  OBC: ["OBC", "backward class", "backward classes", "other backward"],
-  SC: ["SC", "scheduled caste", "dalit"],
-  ST: ["ST", "scheduled tribe", "tribal", "adivasi"],
-  EWS: ["EWS", "economically weaker", "economically weaker section"],
-  Minority: ["minority", "minorities", "muslim", "christian", "sikh", "buddhist", "jain", "parsi"],
+  General:  [],
+  OBC:      ["obc", "backward class", "other backward"],
+  SC:       ["sc", "scheduled caste", "dalit"],
+  ST:       ["st", "scheduled tribe", "tribal", "adivasi"],
+  EWS:      ["ews", "economically weaker"],
+  Minority: ["minority", "minorities", "muslim", "christian", "sikh", "buddhist", "jain"],
 };
 
-// ============================================================
-// Income bracket → tags
-// ============================================================
-
 function getIncomeKeywords(income: number): string[] {
-  if (income <= 100000) {
-    return ["BPL", "below poverty", "Antyodaya", "poorest", "free"];
-  }
-  if (income <= 250000) {
-    return ["low income", "EWS", "economically weaker", "subsidised", "subsidy"];
-  }
-  if (income <= 500000) {
-    return ["middle class", "affordable", "LIG"];
-  }
-  if (income <= 1000000) {
-    return ["MIG", "middle income"];
-  }
+  if (income <= 100_000)  return ["bpl", "below poverty", "antyodaya", "free"];
+  if (income <= 250_000)  return ["low income", "ews", "subsidised", "subsidy"];
+  if (income <= 500_000)  return ["middle class", "affordable", "lig"];
+  if (income <= 1_000_000) return ["mig", "middle income"];
   return [];
 }
 
@@ -118,103 +96,54 @@ function getIncomeKeywords(income: number): string[] {
 // Scoring functions
 // ============================================================
 
-/**
- * Scores how well a scheme matches the user's occupation (0–30).
- */
-function scoreOccupation(
-  scheme: GovernmentScheme,
-  occupation: OccupationType
-): number {
-  const keywords = OCCUPATION_KEYWORDS[occupation];
-  if (!keywords || keywords.length === 0) return 0;
-
-  const searchText = [
+function scoreOccupation(scheme: GovernmentScheme, occupation: OccupationType): number {
+  const keywords = OCCUPATION_KEYWORDS[occupation] ?? [];
+  const haystack = [
     scheme.scheme_name,
     scheme.description,
     scheme.eligibility,
     scheme.benefits,
     scheme.category,
     ...(scheme.tags ?? []),
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
+  ].filter(Boolean).join(" ").toLowerCase();
 
   let hits = 0;
-  for (const keyword of keywords) {
-    if (searchText.includes(keyword.toLowerCase())) {
-      hits++;
-    }
+  for (const kw of keywords) {
+    if (haystack.includes(kw)) hits++;
   }
-
-  // Normalize: cap at 5 hits for full score
-  const ratio = Math.min(hits / 5, 1);
-  return Math.round(ratio * 30);
+  return Math.round(Math.min(hits / 5, 1) * 30);
 }
 
-/**
- * Scores how well a scheme matches the user's social category (0–20).
- */
-function scoreSocialCategory(
-  scheme: GovernmentScheme,
-  category: SocialCategory
-): number {
-  if (category === "General") return 10; // Neutral — eligible for most
+function scoreState(scheme: GovernmentScheme, userState: string): number {
+  const states = (scheme.states ?? []).map((s) => s.toLowerCase());
+  if (states.length === 0) return 10;
+  if (states.includes(userState.toLowerCase())) return 25;
+  if (states.includes("all india")) return 20;
+  return 0;
+}
 
-  const keywords = CATEGORY_KEYWORDS[category];
-  if (!keywords || keywords.length === 0) return 0;
-
-  const searchText = [
+function scoreCategory(scheme: GovernmentScheme, category: SocialCategory): number {
+  if (category === "General") return 10;
+  const keywords = CATEGORY_KEYWORDS[category] ?? [];
+  const haystack = [
     scheme.scheme_name,
     scheme.description,
     scheme.eligibility,
     ...(scheme.tags ?? []),
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
+  ].filter(Boolean).join(" ").toLowerCase();
 
   let hits = 0;
-  for (const keyword of keywords) {
-    if (searchText.includes(keyword.toLowerCase())) {
-      hits++;
-    }
+  for (const kw of keywords) {
+    if (haystack.includes(kw)) hits++;
   }
-
   if (hits >= 2) return 20;
   if (hits === 1) return 14;
-  return 5; // No explicit exclusion → partial score
+  return 5;
 }
 
-/**
- * Scores state match (0–25).
- * "All India" schemes always get a partial score.
- */
-function scoreState(
-  scheme: GovernmentScheme,
-  userState: string
-): number {
-  const states = (scheme.states ?? []).map((s) => s.toLowerCase());
-
-  if (states.length === 0) return 10; // No state data → neutral
-
-  const userStateLower = userState.toLowerCase();
-
-  if (states.includes(userStateLower)) return 25;       // Exact match
-  if (states.includes("all india")) return 20;           // National scheme
-  return 0;                                              // Different state
-}
-
-/**
- * Scores tag relevance (0–15).
- * Matches scheme tags against occupation keywords + income keywords.
- */
-function scoreTags(
-  scheme: GovernmentScheme,
-  profile: UserProfile
-): number {
+function scoreTags(scheme: GovernmentScheme, profile: UserProfile): number {
   const schemeTags = (scheme.tags ?? []).map((t) => t.toLowerCase());
-  if (schemeTags.length === 0) return 5; // No tags → neutral
+  if (schemeTags.length === 0) return 5;
 
   const profileKeywords = [
     ...OCCUPATION_KEYWORDS[profile.occupation],
@@ -226,179 +155,251 @@ function scoreTags(
 
   let hits = 0;
   for (const tag of schemeTags) {
-    for (const keyword of profileKeywords) {
-      if (tag.includes(keyword) || keyword.includes(tag)) {
-        hits++;
-        break; // Count each tag once
+    if (profileKeywords.some((kw) => tag.includes(kw) || kw.includes(tag))) {
+      hits++;
+    }
+  }
+  return Math.round(Math.min(hits / Math.max(schemeTags.length, 1), 1) * 15);
+}
+
+function scoreIncome(scheme: GovernmentScheme, income: number): number {
+  const haystack = [scheme.eligibility, scheme.description, scheme.benefits]
+    .filter(Boolean).join(" ").toLowerCase();
+  const keywords = getIncomeKeywords(income);
+  if (keywords.length === 0) return 5;
+
+  let hits = 0;
+  for (const kw of keywords) {
+    if (haystack.includes(kw)) hits++;
+  }
+  if (hits >= 2) return 10;
+  if (hits === 1) return 7;
+  return 3;
+}
+
+// ============================================================
+// rankSchemes()
+// Scores and sorts an array of schemes against a UserProfile.
+// ============================================================
+
+export function rankSchemes(
+  schemes: GovernmentScheme[],
+  profile: UserProfile
+): RankedScheme[] {
+  return schemes
+    .map((scheme): RankedScheme => {
+      const breakdown: ScoreBreakdown = {
+        occupationScore: scoreOccupation(scheme, profile.occupation),
+        stateScore:      scoreState(scheme, profile.state),
+        categoryScore:   scoreCategory(scheme, profile.category),
+        tagsScore:       scoreTags(scheme, profile),
+        incomeScore:     scoreIncome(scheme, profile.income),
+      };
+
+      const relevanceScore = Math.min(
+        breakdown.occupationScore +
+        breakdown.stateScore +
+        breakdown.categoryScore +
+        breakdown.tagsScore +
+        breakdown.incomeScore,
+        100
+      );
+
+      return { scheme, relevanceScore, scoreBreakdown: breakdown };
+    })
+    .sort((a, b) => b.relevanceScore - a.relevanceScore);
+}
+
+// ============================================================
+// getCachedSchemes()
+// Pulls ALL schemes matching the user's state from Supabase,
+// plus national "All India" schemes.
+// ============================================================
+
+export async function getCachedSchemes(
+  profile: UserProfile
+): Promise<GovernmentScheme[]> {
+  const db = getSupabaseClient();
+
+  // Fetch state-specific and All India schemes in one query
+  const { data: stateData, error: stateError } = await db
+    .from("scheme_cache")
+    .select("*")
+    .or(`states.cs.{"${profile.state}"},states.cs.{"All India"}`)
+    .order("benefit_value", { ascending: false });
+
+  // Also fetch schemes with no state restriction
+  const { data: emptyStateData, error: emptyStateError } = await db
+    .from("scheme_cache")
+    .select("*")
+    .eq("states", "{}");
+
+  if (stateError) {
+    console.error("[getCachedSchemes] State query error:", stateError.message);
+  }
+  if (emptyStateError) {
+    console.error("[getCachedSchemes] Empty-state query error:", emptyStateError.message);
+  }
+
+  // Merge and deduplicate by id
+  const seen = new Map<string, GovernmentScheme>();
+  for (const row of [...(stateData ?? []), ...(emptyStateData ?? [])]) {
+    const typed = row as GovernmentScheme;
+    seen.set(typed.id, typed);
+  }
+
+  return Array.from(seen.values());
+}
+
+// ============================================================
+// triggerDiscoveryIfNeeded()
+// Calls SchemeDiscoveryService to generate search queries,
+// then fetches schemes from the cache using those keywords.
+// Saves any newly found schemes back to the Supabase cache.
+//
+// NOTE: SchemeDiscoveryService generates search query strings.
+// In a full pipeline this would call a web scraper / external
+// API. Here we search the Supabase cache with those keywords
+// and also insert placeholder records for freshly discovered
+// schemes so the cache stays warm.
+// ============================================================
+
+async function triggerDiscoveryIfNeeded(
+  profile: UserProfile,
+  existingIds: Set<string>
+): Promise<GovernmentScheme[]> {
+  const db = getSupabaseClient();
+
+  // 1. Generate targeted search queries from the profile
+  const queries = SchemeDiscoveryService.generateTopQueries(profile, 5);
+
+  const discovered = new Map<string, GovernmentScheme>();
+
+  // 2. Search the Supabase cache with each generated query
+  for (const query of queries) {
+    const term = `%${query.split(" ").slice(0, 3).join("%")}%`;
+
+    const { data, error } = await db
+      .from("scheme_cache")
+      .select("*")
+      .or(
+        [
+          `scheme_name.ilike.${term}`,
+          `description.ilike.${term}`,
+          `eligibility.ilike.${term}`,
+          `tags.cs.{${query.split(" ")[0]}}`,
+        ].join(",")
+      )
+      .limit(10);
+
+    if (error) {
+      console.error(`[triggerDiscoveryIfNeeded] Query "${query}" error:`, error.message);
+      continue;
+    }
+
+    for (const row of data ?? []) {
+      const scheme = row as GovernmentScheme;
+      if (!existingIds.has(scheme.id)) {
+        discovered.set(scheme.id, scheme);
       }
     }
   }
 
-  const ratio = Math.min(hits / Math.max(schemeTags.length, 1), 1);
-  return Math.round(ratio * 15);
+  // 3. If we found new schemes that aren't in the cache already, upsert them
+  const newSchemes = Array.from(discovered.values());
+
+  if (newSchemes.length > 0) {
+    const inserts: SchemeInsert[] = newSchemes.map(
+      ({ id: _id, fetched_at: _fa, ...rest }) => rest
+    );
+    await saveMultipleSchemes(inserts);
+  }
+
+  return newSchemes;
 }
 
-/**
- * Scores income compatibility (0–10).
- * Higher score if the scheme targets the user's income bracket.
- */
-function scoreIncome(
-  scheme: GovernmentScheme,
-  income: number
-): number {
-  const searchText = [
-    scheme.eligibility,
-    scheme.description,
-    scheme.benefits,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
+// ============================================================
+// retrieveRelevantSchemes() — Main entry point
+//
+// Flow:
+//   1. Pull schemes from Supabase cache (state + All India)
+//   2. Rank by relevance score
+//   3. Filter by minScore threshold
+//   4. If fewer than MIN_RELEVANT_SCHEMES remain → trigger discovery
+//   5. Merge, re-rank, and return final results
+// ============================================================
 
-  const incomeKeywords = getIncomeKeywords(income);
-  if (incomeKeywords.length === 0) return 5; // No specific bracket
+export async function retrieveRelevantSchemes(
+  profile: UserProfile,
+  options: RetrievalOptions = {}
+): Promise<RetrievalResult> {
+  const limit    = options.limit    ?? DEFAULT_RETRIEVAL_LIMIT;
+  const minScore = options.minScore ?? DEFAULT_MIN_SCORE;
 
-  let hits = 0;
-  for (const keyword of incomeKeywords) {
-    if (searchText.includes(keyword.toLowerCase())) {
-      hits++;
+  // ---- Step 1: Pull from cache ----------------------------
+  const cached = await getCachedSchemes(profile);
+  const cachedIds = new Set(cached.map((s) => s.id));
+
+  // ---- Step 2: Rank cached schemes -----------------------
+  const ranked = rankSchemes(cached, profile);
+  const relevant = ranked.filter((r) => r.relevanceScore >= minScore);
+
+  // ---- Step 3: Discovery if needed -----------------------
+  let discoveryTriggered = false;
+  let fromDiscovery = 0;
+  let discoveredRanked: RankedScheme[] = [];
+
+  const needsDiscovery =
+    options.forceDiscovery || relevant.length < MIN_RELEVANT_SCHEMES;
+
+  if (needsDiscovery) {
+    discoveryTriggered = true;
+
+    const newSchemes = await triggerDiscoveryIfNeeded(profile, cachedIds);
+    fromDiscovery = newSchemes.length;
+
+    if (newSchemes.length > 0) {
+      discoveredRanked = rankSchemes(newSchemes, profile).filter(
+        (r) => r.relevanceScore >= minScore
+      );
     }
   }
 
-  if (hits >= 2) return 10;
-  if (hits === 1) return 7;
-  return 3; // No income info → minor score
-}
+  // ---- Step 4: Merge and re-rank -------------------------
+  const mergedMap = new Map<string, RankedScheme>();
 
-/**
- * Computes the total relevance score for a scheme (0–100).
- */
-function computeScore(
-  scheme: GovernmentScheme,
-  profile: UserProfile
-): ScoredScheme {
-  const breakdown: MatchBreakdown = {
-    occupationScore: scoreOccupation(scheme, profile.occupation),
-    categoryScore: scoreSocialCategory(scheme, profile.category),
-    stateScore: scoreState(scheme, profile.state),
-    tagsScore: scoreTags(scheme, profile),
-    incomeScore: scoreIncome(scheme, profile.income),
-  };
+  for (const r of [...relevant, ...discoveredRanked]) {
+    const id = r.scheme.id;
+    const existing = mergedMap.get(id);
+    // Keep the higher-scored entry if duplicated
+    if (!existing || r.relevanceScore > existing.relevanceScore) {
+      mergedMap.set(id, r);
+    }
+  }
 
-  const total =
-    breakdown.occupationScore +
-    breakdown.categoryScore +
-    breakdown.stateScore +
-    breakdown.tagsScore +
-    breakdown.incomeScore;
+  const finalRanked = Array.from(mergedMap.values())
+    .sort((a, b) => b.relevanceScore - a.relevanceScore)
+    .slice(0, limit);
+
+  // ---- Step 5: Build result --------------------------------
+  const avgScore =
+    finalRanked.length > 0
+      ? Math.round(
+          finalRanked.reduce((sum, r) => sum + r.relevanceScore, 0) /
+            finalRanked.length
+        )
+      : 0;
+
+  const fromCache = finalRanked.filter((r) =>
+    cachedIds.has(r.scheme.id)
+  ).length;
 
   return {
-    scheme,
-    relevanceScore: Math.min(total, 100),
-    matchBreakdown: breakdown,
+    schemes: finalRanked,
+    totalFound: finalRanked.length,
+    averageScore: avgScore,
+    fromCache,
+    fromDiscovery,
+    discoveryTriggered,
   };
 }
-
-// ============================================================
-// Main Service
-// ============================================================
-
-export class SchemeRetrievalService {
-  /**
-   * Retrieves and ranks all cached schemes against a user profile.
-   *
-   * @param profile - The user's profile
-   * @param options - Optional limit and minimum score threshold
-   * @returns Sorted array of scored schemes + average relevance
-   */
-  static async getRelevantSchemes(
-    profile: UserProfile,
-    options?: {
-      limit?: number;
-      minScore?: number;
-    }
-  ): Promise<RetrievalResult> {
-    const limit = options?.limit ?? 20;
-    const minScore = options?.minScore ?? 15;
-
-    const supabase = getSupabaseClient();
-
-    // 1. Fetch schemes matching user's state or All India
-    const { data: stateSchemes, error: stateError } = await supabase
-      .from("scheme_cache")
-      .select("*")
-      .or(
-        `states.cs.{"${profile.state}"},states.cs.{"All India"}`
-      );
-
-    // 2. Also fetch schemes with no state restriction (empty array)
-    const { data: genericSchemes, error: genericError } = await supabase
-      .from("scheme_cache")
-      .select("*")
-      .eq("states", "{}");
-
-    if (stateError) {
-      console.error("State scheme fetch error:", stateError.message);
-    }
-    if (genericError) {
-      console.error("Generic scheme fetch error:", genericError.message);
-    }
-
-    // 3. Merge and deduplicate by id
-    const allSchemes = new Map<string, GovernmentScheme>();
-
-    for (const scheme of [...(stateSchemes ?? []), ...(genericSchemes ?? [])]) {
-      const typed = scheme as GovernmentScheme;
-      allSchemes.set(typed.id, typed);
-    }
-
-    // 4. Score every scheme
-    const scored: ScoredScheme[] = Array.from(allSchemes.values())
-      .map((scheme) => computeScore(scheme, profile))
-      .filter((s) => s.relevanceScore >= minScore)
-      .sort((a, b) => b.relevanceScore - a.relevanceScore)
-      .slice(0, limit);
-
-    // 5. Compute average
-    const avgScore =
-      scored.length > 0
-        ? Math.round(
-            scored.reduce((sum, s) => sum + s.relevanceScore, 0) / scored.length
-          )
-        : 0;
-
-    return {
-      schemes: scored,
-      averageRelevanceScore: avgScore,
-      totalMatched: scored.length,
-    };
-  }
-
-  /**
-   * Quick lookup: returns the top N schemes without full scoring.
-   * Useful for preview / autocomplete scenarios.
-   */
-  static async getTopSchemes(
-    profile: UserProfile,
-    count: number = 5
-  ): Promise<ScoredScheme[]> {
-    const result = await SchemeRetrievalService.getRelevantSchemes(profile, {
-      limit: count,
-      minScore: 10,
-    });
-    return result.schemes;
-  }
-
-  /**
-   * Scores a single scheme against a profile.
-   * Useful when you already have the scheme object.
-   */
-  static scoreScheme(
-    scheme: GovernmentScheme,
-    profile: UserProfile
-  ): ScoredScheme {
-    return computeScore(scheme, profile);
-  }
-}
-
-export default SchemeRetrievalService;
