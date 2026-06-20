@@ -76,25 +76,26 @@ ALTER TABLE scheme_cache       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE search_logs        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE generated_reports  ENABLE ROW LEVEL SECURITY;
 
--- Allow public read access to scheme_cache (schemes are public data)
+-- Idempotent Policy Creation (drops existing policies first)
+DROP POLICY IF EXISTS "Allow public read access on scheme_cache" ON scheme_cache;
 CREATE POLICY "Allow public read access on scheme_cache"
     ON scheme_cache
     FOR SELECT
     USING (true);
 
--- Allow authenticated inserts into search_logs
+DROP POLICY IF EXISTS "Allow anon insert on search_logs" ON search_logs;
 CREATE POLICY "Allow anon insert on search_logs"
     ON search_logs
     FOR INSERT
     WITH CHECK (true);
 
--- Allow authenticated inserts into generated_reports
+DROP POLICY IF EXISTS "Allow anon insert on generated_reports" ON generated_reports;
 CREATE POLICY "Allow anon insert on generated_reports"
     ON generated_reports
     FOR INSERT
     WITH CHECK (true);
 
--- Allow public read on generated_reports (users view their reports)
+DROP POLICY IF EXISTS "Allow public read on generated_reports" ON generated_reports;
 CREATE POLICY "Allow public read on generated_reports"
     ON generated_reports
     FOR SELECT
