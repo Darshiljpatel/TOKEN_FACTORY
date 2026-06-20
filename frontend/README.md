@@ -57,25 +57,18 @@ src/
     scheme.ts
 ```
 
-## How the flow works (frontend-only, no backend yet)
+## How the Flow Works (Fully Integrated Backend)
 
-1. The person describes themselves in the textarea, or taps a demo profile
-   card (Student, Farmer, Small Business Owner, Senior Citizen) to auto-fill it.
-2. On submit, `interpretProfile()` in `src/data/mockProfile.ts` does light
-   keyword detection (category, state, income, social category) to build a
-   `CitizenProfile`.
-3. `getSchemesForCategory()` in `src/data/mockSchemes.ts` returns a relevant
-   mock list of `Scheme` objects for that category.
-4. A friendly, non-technical loading screen plays for a few seconds.
-5. The results dashboard renders the benefit summary, profile tags, scheme
-   cards, priority groupings and a next-steps timeline.
-
-### Plugging in a real backend later
-
-Replace the two functions in `src/data/mockProfile.ts` and
-`src/data/mockSchemes.ts` with real API calls (e.g. inside `handleSubmit` in
-`src/app/page.tsx`), keeping the same `CitizenProfile` / `Scheme` shapes so no
-component needs to change.
+1. The user describes their background (e.g., "I am a 19 year old engineering student from Karnataka family income 3 lakh, caste OBC") or taps a demo profile card.
+2. On submit, a POST request is made to `/api/find-schemes` passing the raw profile text.
+3. The API Orchestrator:
+   - Extracts structured profile dimensions (Zod validated) using Nebius AI `Qwen/Qwen3-235B-A22B-Instruct-2507`.
+   - Queries the Supabase database cache for matching state/occupation/category schemes.
+   - Triggers Web Search Query Generation and discovery for live scheme updates, saving new schemes to Supabase.
+   - Evaluates scheme-by-scheme eligibility reasoning using Nebius AI `deepseek-ai/DeepSeek-V3.2`.
+   - Generates benefits analysis breakdown and a prioritized application roadmap.
+   - Stores search logs and report statistics.
+4. A smooth loader transitions and displays the results dashboard dynamically translating into selected regional Indian languages.
 
 ## Design notes
 
