@@ -12,7 +12,6 @@ TOKEN_FACTORY/
 │   ├── prompts/             # System prompts for extraction, roadmap, translation etc.
 │   ├── services/            # Profile extractor, discoverer, translator agents (Nebius)
 │   └── tests/               # Standalone Python integration & unit tests
-├── backend/                 # Standalone backend modules
 ├── frontend/                # Integrated Next.js Web Application
 │   ├── src/
 │   │   ├── app/             # Next.js App Router (pages and API routes)
